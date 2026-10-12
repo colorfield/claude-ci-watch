@@ -37,29 +37,31 @@ export function fromPull(json: string): { pull: CiPull; checks: CiCheck[] } {
     reviewDecision: data.reviewDecision ?? '',
     mergeStateStatus: data.mergeStateStatus ?? '',
   }
-  return { pull, checks: dedupe((data.statusCheckRollup ?? []).map(fromRollup)) }
+  return { pull, checks: newestOfEach((data.statusCheckRollup ?? []).map(fromRollup)) }
 }
 
 export function fromRuns(json: string): CiCheck[] {
   const runs = JSON.parse(json) as RunEntry[]
-  // gh lists newest first: the first run of each workflow is its current one.
-  return dedupe(runs.map(run => ({
+  return newestOfEach(runs.map(run => ({
     name: run.workflowName ?? run.name ?? 'run',
     state: run.status === 'completed' ? conclusionState(run.conclusion) : 'pending',
     url: run.url,
-    startedAt: run.createdAt,
-    completedAt: run.status === 'completed' ? run.updatedAt : undefined,
+    startedAt: time(run.createdAt),
+    completedAt: run.status === 'completed' ? time(run.updatedAt) : undefined,
   })))
 }
 
 function fromRollup(entry: RollupEntry): CiCheck {
   if (entry.__typename === 'StatusContext') {
     const state = (entry.state ?? '').toUpperCase()
+    const isPending = state === 'PENDING' || state === 'EXPECTED'
     return {
       name: entry.context ?? 'status',
-      state: state === 'SUCCESS' ? 'success' : state === 'PENDING' || state === 'EXPECTED' ? 'pending' : 'failure',
+      state: state === 'SUCCESS' ? 'success' : isPending ? 'pending' : 'failure',
       url: entry.targetUrl || undefined,
-      startedAt: entry.startedAt,
+      // A status says when it was posted, never when it finished: a settled
+      // one shows no duration rather than one that keeps growing.
+      startedAt: isPending ? time(entry.startedAt) : undefined,
       completedAt: undefined,
     }
   }
@@ -68,8 +70,8 @@ function fromRollup(entry: RollupEntry): CiCheck {
     name: entry.workflowName && entry.name !== entry.workflowName ? `${entry.workflowName} / ${entry.name}` : entry.name ?? 'check',
     state: isDone ? conclusionState(entry.conclusion) : 'pending',
     url: entry.detailsUrl || undefined,
-    startedAt: entry.startedAt || undefined,
-    completedAt: isDone ? entry.completedAt || undefined : undefined,
+    startedAt: time(entry.startedAt),
+    completedAt: isDone ? time(entry.completedAt) : undefined,
   }
 }
 
@@ -88,10 +90,41 @@ function conclusionState(conclusion: string | null | undefined): CiState {
   }
 }
 
-// A re-run lists a check twice; the first listed is the newest.
-function dedupe(checks: CiCheck[]): CiCheck[] {
-  const seen = new Set<string>()
-  return checks.filter(check => !seen.has(check.name) && seen.add(check.name) !== undefined)
+// gh's timestamps, with Go's zero time ("0001-01-01T00:00:00Z", a run not
+// started yet) and blanks read as unknown.
+export function time(value: string | null | undefined): string | undefined {
+  return value && !value.startsWith('0001-') && !Number.isNaN(Date.parse(value)) ? value : undefined
+}
+
+// Checks sharing a name started within this of each other belong to one wave
+// (one push seen as push and pull_request): the worst of them stands.
+// Further apart, the later is a re-run and replaces the earlier.
+const SAME_WAVE_MS = 60_000
+
+const SEVERITY: Record<CiState, number> = { failure: 4, pending: 3, cancelled: 2, success: 1, skipped: 0 }
+
+// One check per name, whatever order gh lists them in.
+export function newestOfEach(checks: readonly CiCheck[]): CiCheck[] {
+  const kept = new Map<string, CiCheck>()
+  for (const check of checks) {
+    const held = kept.get(check.name)
+    if (held === undefined) {
+      kept.set(check.name, check)
+      continue
+    }
+    const gap = startOf(check) - startOf(held)
+    const isSameWave = Math.abs(gap) <= SAME_WAVE_MS
+    if (isSameWave ? SEVERITY[check.state] > SEVERITY[held.state] : gap > 0) kept.set(check.name, check)
+  }
+  // In the order gh first listed each name.
+  return [...kept.values()]
+}
+
+// A check waiting to start is the newest of its name; a settled one that
+// says nothing of its start, the oldest.
+function startOf(check: CiCheck): number {
+  if (check.startedAt !== undefined) return Date.parse(check.startedAt)
+  return check.state === 'pending' ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY
 }
 
 export function overall(checks: readonly CiCheck[]): CiState | 'none' {

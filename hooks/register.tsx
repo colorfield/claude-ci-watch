@@ -1,15 +1,18 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { CiCheck, CiSnapshot } from '../types'
+import type { CiCheck, CiHead, CiSnapshot } from '../types'
 import { duration, fromPull, fromRuns, ICON, overall, summary } from './checks'
+import { branchOf, gitDirOf, startsChecks } from './shell'
 
 // Watches the checks of the current branch's PR (or its workflow runs when
 // it has none) through the gh CLI: a status line while they run, a
 // notification when they settle, and a pane on /ci.
 
 const PANE = 'ci-watch'
+// Everything the pane draws from is state, so every change redraws it.
 const snapshot = atom({ plugin: 'ci-watch', key: 'snapshot' } as const, null)
+const head = atom({ plugin: 'ci-watch', key: 'head' } as const, null)
 
 // Polling: fast while checks run or right after a push, slow otherwise.
 const TICK_MS = 10_000
@@ -17,46 +20,65 @@ const FAST_MS = 20_000
 const SLOW_MS = 120_000
 const AFTER_PUSH_MS = 10 * 60_000
 
-// The module's own pacing; a reload restarts it from session.start.
+// Pacing only; what is known lives in state. A reload restarts it from
+// session.start.
 let nextAt = 0
 let fastUntil = 0
-let isFetching = false
-let lastBranch: string | undefined
+// The read in flight, which a refresh waits for before reading again.
+let reading: Promise<void> | undefined
+// Bumped when the branch (or the checkout) changes: a read started for the
+// previous one writes nothing.
+let generation = 0
+// The HEAD file of the checkout at `headFor`, found once per directory.
+let headFor: string | undefined
+let headPath: string | undefined
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.command.register({ name: 'ci', description: "Show the current branch's CI checks in a pane" })
     nextAt = 0
-    $.clock.every(TICK_MS, () => void tick($))
-    void tick($)
+    $.clock.every(TICK_MS, () => background(tick($)))
+    background(tick($))
     return started
   })
 
+  // The pane opens at once (it says it is reading); the read runs behind it.
   on('command.run', { command: 'ci' }, async $ => {
-    nextAt = 0
-    void tick($)
     const opened = await $.ui.open({ id: PANE, title: 'CI' })
+    background(refresh($))
     return { text: opened.isPlaced ? 'CI pane opened.' : 'CI pane waits for a wider terminal.' }
   })
 
-  // A push (or a PR created or readied) starts new checks: look sooner.
+  // A push (or a PR created or readied) that ran starts new checks: look
+  // sooner. Claude gets its result now; the read runs behind it.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
-    if (/\bgit\s+push\b|\bgh\s+pr\s+(?:create|ready|merge)\b|\bgh\s+run\s+rerun\b/.test(e.command)) {
+    if (ran.deny === undefined && ran.isError !== true && startsChecks(e.command)) {
       fastUntil = (await $.clock.now()) + AFTER_PUSH_MS
-      nextAt = 0
-      void tick($)
+      background(refresh($))
     }
     return ran
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Link, Button } = $.ui.resolve(e)
-    const current = await read($, snapshot)
+    const stored = await read($, snapshot)
+    const checkout = await read($, head)
     const now = await $.clock.now()
+    const refreshButton = <Button key="refresh" label="Refresh" hotkey="r" onPress={() => refresh($)} />
 
-    if (current === null) return <Text dimColor>Reading CI…</Text>
+    if (checkout !== null && checkout.branch === undefined) {
+      return (
+        <Box flexDirection="column">
+          <Text dimColor wrap="wrap">Not on a branch: detached HEAD, or no git repository here.</Text>
+          <Box marginTop={1}>{refreshButton}</Box>
+        </Box>
+      )
+    }
+    // A snapshot of another branch (before the first read after a switch) is not shown.
+    const current = stored !== null && stored.branch === checkout?.branch ? stored : null
+    if (current === null) return <Box gap={1}><Text dimColor>Reading CI…</Text>{refreshButton}</Box>
 
     const room = Math.max(3, (e.viewport?.rows ?? 24) - 8)
     const failed = current.checks.filter(check => check.state === 'failure')
@@ -92,7 +114,7 @@ export const register: Register = on => {
         <Text> </Text>
         {current.error !== undefined && <Text color="warning" wrap="truncate-end">gh: {current.error}</Text>}
         <Box gap={1}>
-          <Button key="refresh" label="Refresh" hotkey="r" onPress={() => { nextAt = 0; void tick($) }} />
+          {refreshButton}
           {failed.length > 0 && (
             <Button
               key="fix"
@@ -108,39 +130,87 @@ export const register: Register = on => {
   })
 }
 
+// An explicit refresh: reads now, or once the read in flight is done (it
+// may predate what asked).
+async function refresh($: EngineInterface) {
+  while (reading !== undefined) await reading
+  nextAt = 0
+  await tick($)
+}
+
 async function tick($: EngineInterface) {
   const now = await $.clock.now()
-  const branch = await currentBranch($)
-  if (branch !== lastBranch) {
-    lastBranch = branch
+  const cwd = await $.session.cwd()
+  const branch = await currentBranch($, cwd)
+  const known = await read($, head)
+  if (known === null || known.cwd !== cwd || known.branch !== branch) {
+    generation += 1
     nextAt = 0
+    const moved: CiHead = { cwd, branch }
+    await update($, head, () => moved)
+    if (branch === undefined) $.ui.status(undefined)
   }
-  if (isFetching || now < nextAt || branch === undefined) return
+  if (branch === undefined || reading !== undefined || now < nextAt) return
 
-  isFetching = true
-  try {
+  const started = generation
+  reading = (async () => {
     const previous = await read($, snapshot)
-    const fresh = await fetchSnapshot($, branch, previous?.branch === branch ? previous : null, now)
+    const sameBranch = previous?.branch === branch ? previous : null
+    let fresh: CiSnapshot
+    try {
+      fresh = await fetchSnapshot($, branch, sameBranch, now)
+    } catch (error) {
+      fresh = stale(sameBranch, branch, now, message(error))
+    }
+    if (started !== generation) return
     await update($, snapshot, () => fresh)
-    announce($, previous?.branch === branch ? previous : null, fresh)
-    const isFast = fresh.overall === 'pending' || now < fastUntil
+    announce($, sameBranch, fresh)
+    // A failing gh backs off, whatever the checks last said.
+    const isFast = fresh.error === undefined && (fresh.overall === 'pending' || now < fastUntil)
     nextAt = now + (isFast ? FAST_MS : SLOW_MS)
-  } catch {
-    nextAt = now + SLOW_MS
+  })()
+  try {
+    await reading
   } finally {
-    isFetching = false
+    reading = undefined
+  }
+  // The branch moved while it read: read for the new one now.
+  if (started !== generation) await tick($)
+}
+
+// The branch, from the checkout's HEAD file (no git process every tick):
+// the `.git` directory, or the git dir a worktree's `.git` file names.
+async function currentBranch($: EngineInterface, cwd: string): Promise<string | undefined> {
+  try {
+    if (headFor !== cwd) {
+      headFor = cwd
+      headPath = await findHead($, cwd)
+    }
+    return headPath === undefined ? undefined : branchOf(await $.fs.read(headPath))
+  } catch {
+    headFor = undefined
+    return undefined
   }
 }
 
-async function currentBranch($: EngineInterface): Promise<string | undefined> {
-  const { exitCode, stdout } = await $.process.run(['git', 'branch', '--show-current'], { timeoutMs: 5000 })
-  const branch = stdout.trim()
-  return exitCode === 0 && branch !== '' ? branch : undefined
+async function findHead($: EngineInterface, cwd: string): Promise<string | undefined> {
+  for (let directory = cwd; ; directory = directory.slice(0, directory.lastIndexOf('/')) || '/') {
+    const dotGit = `${directory === '/' ? '' : directory}/.git`
+    if (await $.fs.exists(dotGit)) {
+      const { kind } = await $.fs.stat(dotGit)
+      if (kind === 'dir') return `${dotGit}/HEAD`
+      const gitDir = gitDirOf(await $.fs.read(dotGit), directory)
+      return gitDir === undefined ? undefined : `${gitDir}/HEAD`
+    }
+    if (directory === '/') return undefined
+  }
 }
 
 async function fetchSnapshot($: EngineInterface, branch: string, previous: CiSnapshot | null, now: number): Promise<CiSnapshot> {
+  // No branch argument: gh then finds the PR this checkout pushes to, never
+  // a fork's PR from a branch of the same name, nor PR #123 for a branch "123".
   const pr = await $.process.run(
-    ['gh', 'pr', 'view', branch, '--json', 'number,title,url,state,isDraft,reviewDecision,mergeStateStatus,statusCheckRollup'],
+    ['gh', 'pr', 'view', '--json', 'number,title,url,state,isDraft,reviewDecision,mergeStateStatus,statusCheckRollup'],
     { timeoutMs: 30_000 },
   )
   if (pr.exitCode === 0) {
@@ -150,7 +220,7 @@ async function fetchSnapshot($: EngineInterface, branch: string, previous: CiSna
   if (!/no pull requests found/i.test(pr.stderr)) return stale(previous, branch, now, pr.stderr)
 
   const runs = await $.process.run(
-    ['gh', 'run', 'list', '--branch', branch, '--limit', '10', '--json', 'name,workflowName,status,conclusion,url,createdAt,updatedAt'],
+    ['gh', 'run', 'list', '--branch', branch, '--limit', '20', '--json', 'name,workflowName,status,conclusion,url,createdAt,updatedAt'],
     { timeoutMs: 30_000 },
   )
   if (runs.exitCode !== 0) return stale(previous, branch, now, runs.stderr)
@@ -169,9 +239,11 @@ function stale(previous: CiSnapshot | null, branch: string, now: number, stderr:
 function announce($: EngineInterface, previous: CiSnapshot | null, fresh: CiSnapshot) {
   const label = fresh.pull === null ? fresh.branch : `PR #${fresh.pull.number}`
 
-  $.ui.status(fresh.overall === 'none' || fresh.overall === 'success' || fresh.overall === 'skipped'
-    ? undefined
-    : `CI ${label} ${ICON[fresh.overall]} ${summary(fresh.checks)}`)
+  $.ui.status(fresh.error !== undefined
+    ? `CI ${label} ⚠ gh: ${fresh.error.slice(0, 80)}`
+    : fresh.overall === 'none' || fresh.overall === 'success' || fresh.overall === 'skipped'
+      ? undefined
+      : `CI ${label} ${ICON[fresh.overall]} ${summary(fresh.checks)}`)
 
   // Only a run that was seen pending and has now settled is news.
   if (previous?.overall !== 'pending' || fresh.overall === 'pending' || fresh.error !== undefined) return
@@ -206,4 +278,16 @@ function review(decision: string): string {
     case 'REVIEW_REQUIRED': return 'review required'
     default: return ''
   }
+}
+
+// Work nobody awaits: it records its own failures; what is left (the module
+// unloading under it) is dropped, never left unhandled.
+function background(work: Promise<unknown>) {
+  work.catch(() => undefined)
+}
+
+// Why gh could not run at all (missing, timed out): its own failures come
+// back as stderr instead.
+function message(error: unknown): string {
+  return `could not run gh: ${error instanceof Error ? error.message : String(error)}`
 }

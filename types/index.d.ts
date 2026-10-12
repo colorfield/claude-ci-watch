@@ -29,8 +29,12 @@ export type CiSnapshot = {
   error: string | undefined
 }
 
+// The branch the session's checkout is on; undefined off a branch (detached
+// HEAD) or outside a git repository.
+export type CiHead = { cwd: string; branch: string | undefined }
+
 declare module 'claude-code' {
   interface PluginState {
-    'ci-watch': { snapshot: CiSnapshot | null }
+    'ci-watch': { snapshot: CiSnapshot | null; head: CiHead | null }
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "ci-watch",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pane and status line for the current branch's PR checks (GitHub), with a notification when CI settles",
   "author": {
     "name": "Christophe Jossart"
