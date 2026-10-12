@@ -1,0 +1,11 @@
+{
+  "name": "ci-watch",
+  "version": "0.1.0",
+  "description": "Pane and status line for the current branch's PR checks (GitHub), with a notification when CI settles",
+  "author": {
+    "name": "Christophe Jossart"
+  },
+  "repository": "https://github.com/colorfield/claude-ci-watch",
+  "types": "./types/index.d.ts",
+  "license": "MIT"
+}

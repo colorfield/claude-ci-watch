@@ -1,0 +1,16 @@
+{
+  "name": "claude-ci-watch",
+  "owner": {
+    "name": "Christophe Jossart"
+  },
+  "metadata": {
+    "description": "Pane and status line for the current branch's PR checks (GitHub), with a notification when CI settles"
+  },
+  "plugins": [
+    {
+      "name": "ci-watch",
+      "source": "./",
+      "description": "Pane and status line for the current branch's PR checks (GitHub), with a notification when CI settles"
+    }
+  ]
+}
